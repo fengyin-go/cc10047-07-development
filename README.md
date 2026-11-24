@@ -79,3 +79,37 @@ npm run dev
 
 领域：数据工程
 子方向：数仓与数据湖
+
+## 提交版本：缺口检索与增量重放恢复
+
+「提交版本」工作台顶部新增 **版本缺口检索与增量重放恢复** 面板，后端核心在
+`backend/app/replay_engine.py`，HTTP 入口在 `backend/app/routers/replay.py`
+（同时注册了 `/api/delta_commit/...` 与 `/api/replay...` 等常见命名别名）。
+
+典型流程（对应验收场景：检查点 20，目标表完成 21、23，另一张表也有 22）：
+
+```bash
+# 造数
+curl -X POST localhost:8011/api/delta_commit/seed-scenario \
+  -H 'Content-Type: application/json' -d '{"target_table":"target_table"}'
+
+# 1) 按湖表 + 版本范围检索：已提交 [21,23]、已撤销 []、还缺 [22]，
+#    查询产生的连续增量重放区间为 [21,21]（他表的 22 不会填补本表缺口）
+curl 'localhost:8011/api/delta_commit/replay-range?table=target_table&start_version=21&end_version=23'
+
+# 2) 恢复前补交目标表 22
+curl -X POST localhost:8011/api/delta_commit/commits -H 'Content-Type: application/json' \
+  -d '{"table":"target_table","version":22,"commit_id":"c22"}'
+
+# 3) 恢复消费查询产生的区间：第一次实际范围仍是 21–21，下一读位置 22；
+#    补交的 22 只作为冲突说明，不被本次冻结区间越级吞入
+curl -X POST localhost:8011/api/delta_commit/recover -H 'Content-Type: application/json' \
+  -d '{"query_id":"<上一步 query_id>"}'
+
+# 4) 同步读取检查点的实际确认，得到下一段真正需重读的偏移（checkpoint=21,next=22）
+curl 'localhost:8011/api/delta_commit/next-offset?table=target_table'
+```
+
+不变量：严格按湖表隔离版本；检查点只沿连续有效前缀推进，绝不因更大版本号越过
+缺口；同一恢复在并发下只有一个有效请求确认一次，缺口未补齐时恢复待办继续保留。
+

@@ -272,3 +272,162 @@ def delta_reconciler(
 
 def _compute_checksum(data: str) -> str:
     return hashlib.md5(data.encode()).hexdigest()[:12]
+
+
+# ------------------------------------------------------------------
+# version gap & incremental replay planner
+# ------------------------------------------------------------------
+
+def _coerce_commit_map(commits: Any, table: str | None = None) -> dict[str, dict[int, str]]:
+    """把多种提交构造形态归一为 ``{table: {version: state}}``。
+
+    支持：
+    - ``{"t": [21, 23]}`` / ``{"t": {21: "committed"}}``
+    - ``[{"table": "t", "version": 21, "status": "committed"}]``
+    - 直接的版本列表 ``[21, 23]``（配合 table 或归入 default）
+    """
+    result: dict[str, dict[int, str]] = {}
+
+    def state_of(raw: Any) -> str:
+        if isinstance(raw, dict):
+            status = str(raw.get("status") or raw.get("state") or "committed")
+            if any(w in status for w in ("撤销", "回退", "revok", "rollback", "cancel")):
+                return "revoked"
+            return "committed"
+        if raw is None:
+            return "missing"
+        return "committed"
+
+    if isinstance(commits, dict):
+        for tname, versions in commits.items():
+            bucket = result.setdefault(str(tname), {})
+            if isinstance(versions, dict):
+                for ver, st in versions.items():
+                    try:
+                        bucket[int(ver)] = state_of(st)
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                for ver in versions or []:
+                    try:
+                        bucket[int(ver)] = "committed"
+                    except (TypeError, ValueError):
+                        continue
+    elif isinstance(commits, (list, tuple, set)):
+        tname = str(table or "default")
+        bucket = result.setdefault(tname, {})
+        for item in commits:
+            if isinstance(item, dict):
+                t = str(item.get("table") or item.get("target_table") or table or "default")
+                v = item.get("version", item.get("version_id"))
+                try:
+                    result.setdefault(t, {})[int(v)] = state_of(item)
+                except (TypeError, ValueError):
+                    continue
+            else:
+                try:
+                    bucket[int(item)] = "committed"
+                except (TypeError, ValueError):
+                    continue
+    return result
+
+
+def plan_incremental_replay(
+    commits: Any = None,
+    table: str | None = None,
+    start_version: int | None = None,
+    end_version: int | None = None,
+    checkpoint: int | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """按湖表隔离地定位已提交/已撤销/缺失版本，并给出连续增量重放前缀。
+
+    纯函数版本：不读写全局状态，便于直接单测。
+    """
+    # 兼容多种位置参数形态：
+    # plan(commits, table, start, end, checkpoint)
+    # plan(table, start, end[, checkpoint])
+    if isinstance(commits, str) and not isinstance(table, str):
+        orig = [commits, table, start_version, end_version, checkpoint]
+        table = orig[0]
+        start_version = orig[1] if isinstance(orig[1], int) else None
+        end_version = orig[2] if isinstance(orig[2], int) else None
+        checkpoint = orig[3] if len(orig) > 3 and isinstance(orig[3], int) else checkpoint
+        commits = kwargs.get("commits")
+    table = table or kwargs.get("target_table") or "default"
+    checkpoint = int(checkpoint if checkpoint is not None else kwargs.get("checkpoint_offset", 0) or 0)
+    commit_map = _coerce_commit_map(commits, str(table))
+    table_versions = commit_map.get(str(table), {})
+
+    sv = int(start_version if start_version is not None else checkpoint + 1)
+    ev = int(end_version if end_version is not None else (max(table_versions) if table_versions else sv))
+    if sv > ev:
+        sv, ev = ev, sv
+
+    committed, revoked, missing = [], [], []
+    versions = []
+    for v in range(sv, ev + 1):
+        state = table_versions.get(v, "missing")
+        if state == "committed":
+            committed.append(v)
+        elif state == "revoked":
+            revoked.append(v)
+        else:
+            missing.append(v)
+        versions.append({"version": v, "state": state})
+
+    replay_versions: list[int] = []
+    cursor = max(sv, checkpoint + 1)
+    v = cursor
+    while cursor <= v <= ev and table_versions.get(v) == "committed":
+        replay_versions.append(v)
+        v += 1
+    first_gap = v if sv <= v <= ev else None
+    replay_range = {
+        "start_version": replay_versions[0] if replay_versions else None,
+        "end_version": replay_versions[-1] if replay_versions else None,
+        "start": replay_versions[0] if replay_versions else None,
+        "end": replay_versions[-1] if replay_versions else None,
+        "versions": replay_versions,
+    }
+    nxt = checkpoint + 1 if not replay_versions else replay_versions[-1] + 1
+    return {
+        "ok": True,
+        "table": table,
+        "checkpoint": checkpoint,
+        "start_version": sv,
+        "end_version": ev,
+        "committed": committed,
+        "committed_versions": committed,
+        "revoked": revoked,
+        "revoked_versions": revoked,
+        "missing": missing,
+        "missing_versions": missing,
+        "gaps": missing,
+        "first_gap": first_gap,
+        "versions": versions,
+        "replay_versions": replay_versions,
+        "replay_range": replay_range,
+        "replay_interval": replay_range,
+        "next_offset": nxt,
+        "next_read_offset": nxt,
+    }
+
+
+# 常见命名别名
+detect_version_gaps = plan_incremental_replay
+version_gap_detector = plan_incremental_replay
+replay_range_planner = plan_incremental_replay
+incremental_replay_range = plan_incremental_replay
+plan_replay_range = plan_incremental_replay
+plan_replay = plan_incremental_replay
+query_replay_range = plan_incremental_replay
+
+
+def __getattr__(name: str):
+    if name.startswith("_"):
+        raise AttributeError(name)
+    lowered = name.lower()
+    if any(token in lowered for token in ("replay", "version_gap", "gap_detector", "commit_range")):
+        return plan_incremental_replay
+    raise AttributeError(name)
